@@ -1,5 +1,6 @@
 import logging as l
 from logging.handlers import RotatingFileHandler
+import socket
 
 
 def main():
@@ -22,3 +23,9 @@ def main():
     creds_handler.setFormatter(logging_format)
     
     creds_logger.addHandler(creds_handler)
+
+
+
+def emulated_shell(channel, client_ip):
+    channel.send(b'corporate-jumpbox2$ ')
+    command = b""
