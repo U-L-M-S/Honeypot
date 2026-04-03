@@ -1,2 +1,6 @@
 paramiko>=3.4.0
 flask>=3.0.0
+dash>=2.17.0
+dash-bootstrap-components>=1.6.0
+plotly>=5.23.0
+pandas>=2.2.0
