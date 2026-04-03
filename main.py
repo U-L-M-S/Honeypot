@@ -23,6 +23,8 @@ import socket
 import sys
 import threading
 import time
+import urllib.request
+import urllib.error
 import uuid
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -65,6 +67,13 @@ FAKE_WORKING_DIR = "/home/sysadmin"
 
 # Alert configuration (set via CLI or environment)
 WEBHOOK_URL = os.environ.get("HONEYPOT_WEBHOOK_URL", "")
+
+# IP Intelligence API keys (optional - set via environment)
+ABUSEIPDB_API_KEY = os.environ.get("ABUSEIPDB_API_KEY", "")
+VIRUSTOTAL_API_KEY = os.environ.get("VIRUSTOTAL_API_KEY", "")
+
+# IP Intelligence cache file
+IP_INTEL_CACHE = LOG_DIR / "ip_intel_cache.json"
 
 # =============================================================================
 # LOGGING SETUP
@@ -213,6 +222,364 @@ alert_manager = AlertManager(WEBHOOK_URL)
 
 
 # =============================================================================
+# IP INTELLIGENCE
+# =============================================================================
+
+
+class IPIntelligence:
+    """
+    Gather intelligence about IP addresses:
+    - GeoIP lookup (country, city, coordinates)
+    - ASN/ISP identification
+    - AbuseIPDB reputation score
+    - VirusTotal detections
+
+    Uses caching to minimize API calls.
+    """
+
+    # Cache TTL in seconds (24 hours)
+    CACHE_TTL = 86400
+
+    def __init__(self):
+        self.cache = self._load_cache()
+        self._cache_lock = threading.Lock()
+
+    def _load_cache(self) -> dict:
+        """Load IP intel cache from disk."""
+        if IP_INTEL_CACHE.exists():
+            try:
+                with open(IP_INTEL_CACHE, 'r') as f:
+                    return json.load(f)
+            except:
+                pass
+        return {}
+
+    def _save_cache(self):
+        """Save IP intel cache to disk."""
+        try:
+            with open(IP_INTEL_CACHE, 'w') as f:
+                json.dump(self.cache, f, indent=2)
+        except Exception as e:
+            console.error(f"Failed to save IP intel cache: {e}")
+
+    def _is_cache_valid(self, ip: str) -> bool:
+        """Check if cached data is still valid."""
+        if ip not in self.cache:
+            return False
+        cached = self.cache[ip]
+        if "cached_at" not in cached:
+            return False
+        cached_time = datetime.fromisoformat(cached["cached_at"])
+        age = (datetime.now() - cached_time).total_seconds()
+        return age < self.CACHE_TTL
+
+    def get_intel(self, ip: str) -> dict:
+        """
+        Get all available intelligence for an IP address.
+        Returns cached data if available and valid.
+        """
+        # Check cache first
+        with self._cache_lock:
+            if self._is_cache_valid(ip):
+                console.info(f"IP intel cache hit for {ip}")
+                return self.cache[ip]
+
+        # Gather fresh intel
+        intel = {
+            "ip": ip,
+            "cached_at": datetime.now().isoformat(),
+            "geo": self._get_geoip(ip),
+            "abuse": self._get_abuseipdb(ip) if ABUSEIPDB_API_KEY else None,
+            "virustotal": self._get_virustotal(ip) if VIRUSTOTAL_API_KEY else None,
+        }
+
+        # Cache the results
+        with self._cache_lock:
+            self.cache[ip] = intel
+            self._save_cache()
+
+        return intel
+
+    def _get_geoip(self, ip: str) -> dict:
+        """
+        Get GeoIP data using ip-api.com (free, no key required).
+        Includes: country, city, region, ISP, ASN, coordinates.
+        """
+        try:
+            url = f"http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,asname,mobile,proxy,hosting,query"
+            req = urllib.request.Request(url, headers={"User-Agent": "Honeypot/1.0"})
+
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode())
+
+            if data.get("status") == "success":
+                return {
+                    "country": data.get("country"),
+                    "country_code": data.get("countryCode"),
+                    "region": data.get("regionName"),
+                    "city": data.get("city"),
+                    "zip": data.get("zip"),
+                    "lat": data.get("lat"),
+                    "lon": data.get("lon"),
+                    "timezone": data.get("timezone"),
+                    "isp": data.get("isp"),
+                    "org": data.get("org"),
+                    "asn": data.get("as"),
+                    "asn_name": data.get("asname"),
+                    "is_mobile": data.get("mobile", False),
+                    "is_proxy": data.get("proxy", False),
+                    "is_hosting": data.get("hosting", False),
+                }
+            else:
+                console.warning(f"GeoIP lookup failed for {ip}: {data.get('message')}")
+                return {"error": data.get("message", "Unknown error")}
+
+        except Exception as e:
+            console.error(f"GeoIP lookup error for {ip}: {e}")
+            return {"error": str(e)}
+
+    def _get_abuseipdb(self, ip: str) -> dict:
+        """
+        Check IP reputation on AbuseIPDB.
+        Requires ABUSEIPDB_API_KEY environment variable.
+        Free tier: 1000 checks/day.
+        """
+        if not ABUSEIPDB_API_KEY:
+            return None
+
+        try:
+            url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip}&maxAgeInDays=90&verbose=true"
+            req = urllib.request.Request(url, headers={
+                "Key": ABUSEIPDB_API_KEY,
+                "Accept": "application/json"
+            })
+
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
+
+            abuse_data = data.get("data", {})
+            return {
+                "abuse_score": abuse_data.get("abuseConfidenceScore", 0),
+                "total_reports": abuse_data.get("totalReports", 0),
+                "last_reported": abuse_data.get("lastReportedAt"),
+                "is_whitelisted": abuse_data.get("isWhitelisted", False),
+                "usage_type": abuse_data.get("usageType"),
+                "domain": abuse_data.get("domain"),
+                "hostnames": abuse_data.get("hostnames", []),
+                "is_tor": abuse_data.get("isTor", False),
+                "categories": self._parse_abuse_categories(abuse_data.get("reports", [])),
+            }
+
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                console.warning("AbuseIPDB rate limit reached")
+                return {"error": "rate_limited"}
+            console.error(f"AbuseIPDB error for {ip}: {e}")
+            return {"error": str(e)}
+        except Exception as e:
+            console.error(f"AbuseIPDB error for {ip}: {e}")
+            return {"error": str(e)}
+
+    def _parse_abuse_categories(self, reports: list) -> list:
+        """Parse abuse categories from reports."""
+        categories = set()
+        category_names = {
+            1: "DNS Compromise", 2: "DNS Poisoning", 3: "Fraud Orders",
+            4: "DDoS Attack", 5: "FTP Brute-Force", 6: "Ping of Death",
+            7: "Phishing", 8: "Fraud VoIP", 9: "Open Proxy",
+            10: "Web Spam", 11: "Email Spam", 12: "Blog Spam",
+            13: "VPN IP", 14: "Port Scan", 15: "Hacking",
+            16: "SQL Injection", 17: "Spoofing", 18: "Brute-Force",
+            19: "Bad Web Bot", 20: "Exploited Host", 21: "Web App Attack",
+            22: "SSH", 23: "IoT Targeted"
+        }
+        for report in reports[:10]:  # Limit to recent reports
+            for cat_id in report.get("categories", []):
+                if cat_id in category_names:
+                    categories.add(category_names[cat_id])
+        return list(categories)
+
+    def _get_virustotal(self, ip: str) -> dict:
+        """
+        Check IP on VirusTotal.
+        Requires VIRUSTOTAL_API_KEY environment variable.
+        Free tier: 4 requests/minute, 500/day.
+        """
+        if not VIRUSTOTAL_API_KEY:
+            return None
+
+        try:
+            url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
+            req = urllib.request.Request(url, headers={
+                "x-apikey": VIRUSTOTAL_API_KEY,
+                "Accept": "application/json"
+            })
+
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
+
+            attrs = data.get("data", {}).get("attributes", {})
+            stats = attrs.get("last_analysis_stats", {})
+
+            return {
+                "malicious": stats.get("malicious", 0),
+                "suspicious": stats.get("suspicious", 0),
+                "harmless": stats.get("harmless", 0),
+                "undetected": stats.get("undetected", 0),
+                "reputation": attrs.get("reputation", 0),
+                "as_owner": attrs.get("as_owner"),
+                "network": attrs.get("network"),
+                "total_votes": {
+                    "harmless": attrs.get("total_votes", {}).get("harmless", 0),
+                    "malicious": attrs.get("total_votes", {}).get("malicious", 0),
+                }
+            }
+
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                console.warning("VirusTotal rate limit reached")
+                return {"error": "rate_limited"}
+            console.error(f"VirusTotal error for {ip}: {e}")
+            return {"error": str(e)}
+        except Exception as e:
+            console.error(f"VirusTotal error for {ip}: {e}")
+            return {"error": str(e)}
+
+    def get_threat_level(self, intel: dict) -> tuple[str, list]:
+        """
+        Calculate overall threat level based on gathered intel.
+        Returns: (level, reasons)
+        Levels: "low", "medium", "high", "critical"
+        """
+        reasons = []
+        score = 0
+
+        geo = intel.get("geo", {})
+        abuse = intel.get("abuse", {})
+        vt = intel.get("virustotal", {})
+
+        # Check proxy/VPN/hosting flags
+        if geo.get("is_proxy"):
+            score += 20
+            reasons.append("Proxy/VPN detected")
+        if geo.get("is_hosting"):
+            score += 15
+            reasons.append("Hosting/datacenter IP")
+        if geo.get("is_mobile"):
+            score += 5
+            reasons.append("Mobile network")
+
+        # Check AbuseIPDB
+        if abuse and not isinstance(abuse.get("error"), str):
+            abuse_score = abuse.get("abuse_score", 0)
+            if abuse_score >= 80:
+                score += 50
+                reasons.append(f"AbuseIPDB score: {abuse_score}%")
+            elif abuse_score >= 50:
+                score += 30
+                reasons.append(f"AbuseIPDB score: {abuse_score}%")
+            elif abuse_score >= 25:
+                score += 15
+                reasons.append(f"AbuseIPDB score: {abuse_score}%")
+
+            if abuse.get("is_tor"):
+                score += 25
+                reasons.append("TOR exit node")
+
+            reports = abuse.get("total_reports", 0)
+            if reports >= 100:
+                score += 20
+                reasons.append(f"{reports} abuse reports")
+            elif reports >= 10:
+                score += 10
+                reasons.append(f"{reports} abuse reports")
+
+            categories = abuse.get("categories", [])
+            if "SSH" in categories or "Brute-Force" in categories:
+                score += 25
+                reasons.append("Known SSH/brute-force attacker")
+            if "Hacking" in categories:
+                score += 20
+                reasons.append("Known hacking activity")
+
+        # Check VirusTotal
+        if vt and not isinstance(vt.get("error"), str):
+            malicious = vt.get("malicious", 0)
+            suspicious = vt.get("suspicious", 0)
+            if malicious >= 5:
+                score += 40
+                reasons.append(f"VirusTotal: {malicious} malicious detections")
+            elif malicious >= 1:
+                score += 20
+                reasons.append(f"VirusTotal: {malicious} malicious detections")
+            if suspicious >= 3:
+                score += 15
+                reasons.append(f"VirusTotal: {suspicious} suspicious detections")
+
+        # Determine threat level
+        if score >= 70:
+            level = "critical"
+        elif score >= 45:
+            level = "high"
+        elif score >= 20:
+            level = "medium"
+        else:
+            level = "low"
+
+        return level, reasons
+
+    def format_summary(self, intel: dict) -> str:
+        """Format IP intel as a human-readable summary."""
+        lines = []
+        geo = intel.get("geo", {})
+        abuse = intel.get("abuse")
+        vt = intel.get("virustotal")
+
+        # Location
+        if geo and "error" not in geo:
+            location = f"{geo.get('city', 'Unknown')}, {geo.get('country', 'Unknown')}"
+            lines.append(f"Location: {location}")
+            if geo.get("isp"):
+                lines.append(f"ISP: {geo['isp']}")
+            if geo.get("asn"):
+                lines.append(f"ASN: {geo['asn']}")
+
+            flags = []
+            if geo.get("is_proxy"):
+                flags.append("PROXY")
+            if geo.get("is_hosting"):
+                flags.append("HOSTING")
+            if geo.get("is_mobile"):
+                flags.append("MOBILE")
+            if flags:
+                lines.append(f"Flags: {', '.join(flags)}")
+
+        # AbuseIPDB
+        if abuse and "error" not in abuse:
+            lines.append(f"AbuseIPDB Score: {abuse.get('abuse_score', 0)}%")
+            if abuse.get("total_reports"):
+                lines.append(f"Abuse Reports: {abuse['total_reports']}")
+            if abuse.get("is_tor"):
+                lines.append("TOR Exit Node: Yes")
+            if abuse.get("categories"):
+                lines.append(f"Categories: {', '.join(abuse['categories'][:5])}")
+
+        # VirusTotal
+        if vt and "error" not in vt:
+            lines.append(f"VirusTotal: {vt.get('malicious', 0)} malicious, {vt.get('suspicious', 0)} suspicious")
+
+        # Threat level
+        level, reasons = self.get_threat_level(intel)
+        lines.append(f"Threat Level: {level.upper()}")
+
+        return "\n".join(lines)
+
+
+# Global IP intelligence instance
+ip_intel = IPIntelligence()
+
+
+# =============================================================================
 # SESSION RECORDER
 # =============================================================================
 
@@ -296,7 +663,7 @@ class SessionRecorder:
 
         return False, "human_like"
 
-    def save(self):
+    def save(self, ip_intel: dict = None):
         """Save the session recording to a JSON file."""
         is_bot, bot_reason = self.is_bot()
 
@@ -319,6 +686,26 @@ class SessionRecorder:
                 "max_delay": max(self.keystroke_timings) if self.keystroke_timings else 0,
             }
         }
+
+        # Add IP intelligence if available
+        if ip_intel:
+            session_data["ip_intel"] = ip_intel
+            # Add threat assessment
+            geo = ip_intel.get("geo", {})
+            if geo and "error" not in geo:
+                session_data["country"] = geo.get("country")
+                session_data["country_code"] = geo.get("country_code")
+                session_data["city"] = geo.get("city")
+                session_data["isp"] = geo.get("isp")
+                session_data["asn"] = geo.get("asn")
+                session_data["is_proxy"] = geo.get("is_proxy", False)
+                session_data["is_hosting"] = geo.get("is_hosting", False)
+                session_data["is_tor"] = ip_intel.get("abuse", {}).get("is_tor", False) if ip_intel.get("abuse") else False
+
+            abuse = ip_intel.get("abuse")
+            if abuse and "error" not in abuse:
+                session_data["abuse_score"] = abuse.get("abuse_score", 0)
+                session_data["abuse_reports"] = abuse.get("total_reports", 0)
 
         # Save to file
         filename = SESSIONS_DIR / f"{self.session_id}_{self.client_ip}_{self.start_time.strftime('%Y%m%d_%H%M%S')}.json"
@@ -911,6 +1298,25 @@ def handle_client(client_socket, addr, username=None, password=None, tarpit=Fals
     # Create session recorder
     session_recorder = SessionRecorder(client_ip)
 
+    # Gather IP intelligence (runs in background thread to not delay connection)
+    intel_data = {}
+    def gather_intel():
+        nonlocal intel_data
+        intel_data = ip_intel.get_intel(client_ip)
+        level, reasons = ip_intel.get_threat_level(intel_data)
+
+        # Log IP intel summary
+        geo = intel_data.get("geo", {})
+        if geo and "error" not in geo:
+            location = f"{geo.get('city', 'Unknown')}, {geo.get('country', 'Unknown')}"
+            console.info(f"IP Intel [{client_ip}]: {location} | {geo.get('isp', 'Unknown ISP')}")
+
+        if level in ("high", "critical"):
+            console.warning(f"HIGH THREAT [{client_ip}]: {', '.join(reasons)}")
+
+    intel_thread = threading.Thread(target=gather_intel, daemon=True)
+    intel_thread.start()
+
     # Send connection alert
     alert_manager.send_alert("new_connection", {
         "ip": client_ip,
@@ -954,18 +1360,39 @@ def handle_client(client_socket, addr, username=None, password=None, tarpit=Fals
     except Exception as e:
         console.error(f"Error handling {client_ip}: {e}")
     finally:
-        # Save session recording
-        session_data = session_recorder.save()
+        # Wait for IP intel to complete (max 2 seconds)
+        intel_thread.join(timeout=2)
 
-        # Send session summary alert
-        alert_manager.send_alert("session_ended", {
+        # Save session recording with IP intel
+        session_data = session_recorder.save(ip_intel=intel_data if intel_data else None)
+
+        # Calculate threat level
+        threat_level = "unknown"
+        threat_reasons = []
+        if intel_data:
+            threat_level, threat_reasons = ip_intel.get_threat_level(intel_data)
+
+        # Send session summary alert with IP intel
+        alert_data = {
             "ip": client_ip,
             "session_id": session_recorder.session_id,
             "duration": session_data["duration_seconds"],
             "command_count": session_data["command_count"],
             "is_bot": session_data["is_bot"],
-            "bot_reason": session_data["bot_detection_reason"]
-        })
+            "bot_reason": session_data["bot_detection_reason"],
+            "threat_level": threat_level,
+            "threat_reasons": threat_reasons,
+        }
+
+        # Add geo data if available
+        if intel_data and intel_data.get("geo") and "error" not in intel_data["geo"]:
+            geo = intel_data["geo"]
+            alert_data["country"] = geo.get("country")
+            alert_data["city"] = geo.get("city")
+            alert_data["isp"] = geo.get("isp")
+            alert_data["asn"] = geo.get("asn")
+
+        alert_manager.send_alert("session_ended", alert_data)
 
         # Log bot detection
         if session_data["is_bot"]:
@@ -1196,16 +1623,49 @@ def run_dashboard(port=8050):
         total_commands = len(cmds_df)
         bot_count = sum(1 for s in sessions if s.get('is_bot', False))
 
+        # IP Intelligence stats
+        high_threat_count = sum(1 for s in sessions if s.get('ip_intel', {}).get('abuse', {}).get('abuse_score', 0) >= 50)
+        tor_count = sum(1 for s in sessions if s.get('is_tor', False))
+        proxy_count = sum(1 for s in sessions if s.get('is_proxy', False))
+        hosting_count = sum(1 for s in sessions if s.get('is_hosting', False))
+
+        # Country distribution
+        countries = [s.get('country', 'Unknown') for s in sessions if s.get('country')]
+        country_counts = pd.Series(countries).value_counts().head(10) if countries else pd.Series()
+
+        # ISP distribution
+        isps = [s.get('isp', 'Unknown') for s in sessions if s.get('isp')]
+        isp_counts = pd.Series(isps).value_counts().head(10) if isps else pd.Series()
+
         # Top passwords
         top_passwords = creds_df['password'].value_counts().head(10) if not creds_df.empty else pd.Series()
         top_usernames = creds_df['username'].value_counts().head(10) if not creds_df.empty else pd.Series()
         top_ips = creds_df['ip'].value_counts().head(10) if not creds_df.empty else pd.Series()
         top_commands = cmds_df['command'].value_counts().head(10) if not cmds_df.empty else pd.Series()
 
+        # Sessions table data with IP intel
+        sessions_table_data = []
+        for s in sorted(sessions, key=lambda x: x.get('start_time', ''), reverse=True)[:20]:
+            sessions_table_data.append({
+                'session_id': s.get('session_id', ''),
+                'ip': s.get('client_ip', ''),
+                'country': s.get('country', 'N/A'),
+                'isp': (s.get('isp', 'N/A') or 'N/A')[:30],
+                'commands': s.get('command_count', 0),
+                'is_bot': 'Yes' if s.get('is_bot') else 'No',
+                'abuse_score': s.get('abuse_score', 'N/A'),
+                'flags': ', '.join(filter(None, [
+                    'TOR' if s.get('is_tor') else None,
+                    'PROXY' if s.get('is_proxy') else None,
+                    'HOSTING' if s.get('is_hosting') else None,
+                ])) or '-',
+                'duration': f"{s.get('duration_seconds', 0):.1f}s",
+            })
+
         return dbc.Container([
             html.H1("Honeypot Analytics", className="text-center my-4"),
 
-            # Stats cards
+            # Main stats cards
             dbc.Row([
                 dbc.Col(dbc.Card([
                     dbc.CardBody([
@@ -1233,7 +1693,65 @@ def run_dashboard(port=8050):
                 ]), width=3),
             ], className="mb-4"),
 
-            # Charts
+            # IP Intelligence stats
+            dbc.Row([
+                dbc.Col(dbc.Card([
+                    dbc.CardBody([
+                        html.H4("High Threat IPs", className="card-title"),
+                        html.H2(str(high_threat_count), className="text-danger"),
+                        html.Small("AbuseIPDB score >= 50%")
+                    ])
+                ], color="danger", outline=True), width=3),
+                dbc.Col(dbc.Card([
+                    dbc.CardBody([
+                        html.H4("TOR Exit Nodes", className="card-title"),
+                        html.H2(str(tor_count), className="text-warning"),
+                        html.Small("Anonymous connections")
+                    ])
+                ], color="warning", outline=True), width=3),
+                dbc.Col(dbc.Card([
+                    dbc.CardBody([
+                        html.H4("Proxy/VPN", className="card-title"),
+                        html.H2(str(proxy_count), className="text-info"),
+                        html.Small("Hidden origin")
+                    ])
+                ], color="info", outline=True), width=3),
+                dbc.Col(dbc.Card([
+                    dbc.CardBody([
+                        html.H4("Hosting/DC IPs", className="card-title"),
+                        html.H2(str(hosting_count), className="text-secondary"),
+                        html.Small("Cloud/datacenter")
+                    ])
+                ], color="secondary", outline=True), width=3),
+            ], className="mb-4"),
+
+            # Charts row 1: Countries and ISPs
+            dbc.Row([
+                dbc.Col([
+                    html.H4("Attacks by Country"),
+                    dcc.Graph(
+                        figure=px.pie(
+                            names=country_counts.index.tolist(),
+                            values=country_counts.values.tolist(),
+                            template='plotly_dark',
+                            hole=0.4
+                        ) if not country_counts.empty else {}
+                    )
+                ], width=6),
+                dbc.Col([
+                    html.H4("Top ISPs"),
+                    dcc.Graph(
+                        figure=px.bar(
+                            x=isp_counts.values,
+                            y=isp_counts.index,
+                            orientation='h',
+                            template='plotly_dark'
+                        ) if not isp_counts.empty else {}
+                    )
+                ], width=6),
+            ], className="mb-4"),
+
+            # Charts row 2: Passwords and Usernames
             dbc.Row([
                 dbc.Col([
                     html.H4("Top 10 Passwords"),
@@ -1259,6 +1777,7 @@ def run_dashboard(port=8050):
                 ], width=6),
             ], className="mb-4"),
 
+            # Charts row 3: IPs and Commands
             dbc.Row([
                 dbc.Col([
                     html.H4("Top 10 Attacking IPs"),
@@ -1284,7 +1803,35 @@ def run_dashboard(port=8050):
                 ], width=6),
             ], className="mb-4"),
 
-            # Recent activity table
+            # Sessions table with IP intel
+            html.H4("Recent Sessions (with IP Intelligence)"),
+            dash_table.DataTable(
+                data=sessions_table_data,
+                columns=[
+                    {'name': 'Session', 'id': 'session_id'},
+                    {'name': 'IP', 'id': 'ip'},
+                    {'name': 'Country', 'id': 'country'},
+                    {'name': 'ISP', 'id': 'isp'},
+                    {'name': 'Cmds', 'id': 'commands'},
+                    {'name': 'Bot', 'id': 'is_bot'},
+                    {'name': 'Abuse %', 'id': 'abuse_score'},
+                    {'name': 'Flags', 'id': 'flags'},
+                    {'name': 'Duration', 'id': 'duration'},
+                ],
+                style_table={'overflowX': 'auto'},
+                style_cell={'textAlign': 'left', 'backgroundColor': '#303030', 'color': 'white', 'padding': '8px'},
+                style_header={'backgroundColor': '#404040', 'fontWeight': 'bold'},
+                style_data_conditional=[
+                    {'if': {'filter_query': '{abuse_score} >= 50'}, 'backgroundColor': '#5c2020'},
+                    {'if': {'filter_query': '{is_bot} = "Yes"'}, 'backgroundColor': '#4a3020'},
+                    {'if': {'filter_query': '{flags} contains "TOR"'}, 'backgroundColor': '#3a3a20'},
+                ],
+                page_size=15
+            ),
+
+            html.Br(),
+
+            # Recent login attempts
             html.H4("Recent Login Attempts"),
             dash_table.DataTable(
                 data=creds_df.tail(20).to_dict('records') if not creds_df.empty else [],
